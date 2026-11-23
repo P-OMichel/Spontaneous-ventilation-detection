@@ -1,5 +1,4 @@
 import os
-import json
 import numpy as np
 from scipy import signal
 
@@ -7,7 +6,7 @@ from Annotation_App.annotations import REGIME_TO_ID
 
 
 class VentilationProcessor:
-    """Extracts VitalDB respiratory/EEG/hypnotic tracks and computes initial regime estimates."""
+    """Extracts VitalDB respiratory/EEG/hypnotic tracks (last 1h max) and computes initial regime estimates."""
 
     PROPOFOL_TRACKS = {
         "Orchestra__PPF20_CE": "Propofol Ce (µg/mL)",
@@ -23,8 +22,9 @@ class VentilationProcessor:
         "Solar8000__INSEVO": "Sevoflurane Insp (%)",
     }
 
-    def __init__(self, fs: int = 128):
+    def __init__(self, fs: int = 128, max_duration_sec: float = 3600.0):
         self.fs = fs
+        self.max_duration_sec = max_duration_sec
 
     @staticmethod
     def _get_first_track(
@@ -49,7 +49,8 @@ class VentilationProcessor:
 
     def extract_signals_from_file(self, file_path: str) -> dict:
         """
-        Loads and aligns 128 Hz AWP, CO2, EEG, ECG, plus Compliance from a VitalDB .npz file.
+        Loads and aligns up to the last `max_duration_sec` (default 3600s = 1h)
+        of 128 Hz AWP, CO2, EEG, ECG, plus Compliance from a VitalDB .npz file.
         """
         with np.load(file_path, allow_pickle=True) as data:
             awp_raw = self._get_first_track(data, ["Primus__AWP"])
@@ -65,8 +66,13 @@ class VentilationProcessor:
                 data, ["Primus__COMPLIANCE", "Solar8000__VENT_COMPL"]
             )
 
-        t_start = max(float(awp_raw[0][0]), float(co2_raw[0][0]))
         t_end = min(float(awp_raw[0][-1]), float(co2_raw[0][-1]))
+        t_start = max(float(awp_raw[0][0]), float(co2_raw[0][0]))
+
+        # Restrict to at most the last 1 hour (3600s)
+        if self.max_duration_sec > 0:
+            t_start = max(t_start, t_end - float(self.max_duration_sec))
+
         if t_end <= t_start + 5.0:
             raise ValueError("Overlapping AWP/CO2 duration is too short (< 5s).")
 
@@ -77,7 +83,12 @@ class VentilationProcessor:
             if track is None:
                 return np.zeros(len(t_common), dtype=np.float32)
             t_src, v_src = track
-            valid = np.isfinite(t_src) & np.isfinite(v_src)
+            valid = (
+                np.isfinite(t_src)
+                & np.isfinite(v_src)
+                & (t_src >= t_start - 5.0)
+                & (t_src <= t_end + 5.0)
+            )
             if np.sum(valid) < 2:
                 return np.zeros(len(t_common), dtype=np.float32)
             interp = np.interp(t_common, t_src[valid], v_src[valid], left=0.0, right=0.0)
@@ -89,7 +100,12 @@ class VentilationProcessor:
         ecg_aligned = _resample_to_grid(ecg_raw)
 
         if compl_raw is not None:
-            valid_cp = np.isfinite(compl_raw[0]) & np.isfinite(compl_raw[1])
+            valid_cp = (
+                np.isfinite(compl_raw[0])
+                & np.isfinite(compl_raw[1])
+                & (compl_raw[0] >= t_start)
+                & (compl_raw[0] <= t_end)
+            )
             compl_t = compl_raw[0][valid_cp].astype(np.float32)
             compl_v = compl_raw[1][valid_cp].astype(np.float32)
         else:
@@ -117,12 +133,23 @@ class VentilationProcessor:
         with np.load(file_path, allow_pickle=True) as data:
             file_keys = set(data.files)
 
+            # Determine cutoff so hypnotic tracks match the loaded last-1h window
+            t_cutoff = -np.inf
+            if self.max_duration_sec > 0:
+                if "t_common" in file_keys and len(data["t_common"]) > 0:
+                    t_cutoff = float(data["t_common"][-1]) - float(self.max_duration_sec)
+                elif "Primus__AWP_time" in file_keys and len(data["Primus__AWP_time"]) > 0:
+                    awp_t = np.asarray(data["Primus__AWP_time"], dtype=np.float64)
+                    fin_t = awp_t[np.isfinite(awp_t)]
+                    if len(fin_t) > 0:
+                        t_cutoff = float(fin_t[-1]) - float(self.max_duration_sec)
+
             for base_key, display_name in self.PROPOFOL_TRACKS.items():
                 val_key, time_key = f"{base_key}_val", f"{base_key}_time"
                 if val_key in file_keys and time_key in file_keys:
                     vals = np.asarray(data[val_key], dtype=np.float32)
                     times = np.asarray(data[time_key], dtype=np.float32)
-                    valid = np.isfinite(vals) & np.isfinite(times)
+                    valid = np.isfinite(vals) & np.isfinite(times) & (times >= t_cutoff)
                     if np.any(valid) and np.nanmax(vals[valid]) > 0.0:
                         has_propofol = True
                         tracks.append({
@@ -137,7 +164,7 @@ class VentilationProcessor:
                 if val_key in file_keys and time_key in file_keys:
                     vals = np.asarray(data[val_key], dtype=np.float32)
                     times = np.asarray(data[time_key], dtype=np.float32)
-                    valid = np.isfinite(vals) & np.isfinite(times)
+                    valid = np.isfinite(vals) & np.isfinite(times) & (times >= t_cutoff)
                     if np.any(valid) and np.nanmax(vals[valid]) > 0.0:
                         has_sevo = True
                         tracks.append({
@@ -162,7 +189,9 @@ class VentilationProcessor:
         if len(eeg) <= int(self.fs * 3):
             return eeg.copy()
         nyq = 0.5 * self.fs
-        sos = signal.butter(4, [low_hz / nyq, min(high_hz, 0.45 * self.fs) / nyq], btype="band", output="sos")
+        sos = signal.butter(
+            4, [low_hz / nyq, min(high_hz, 0.45 * self.fs) / nyq], btype="band", output="sos"
+        )
         return signal.sosfiltfilt(sos, eeg).astype(np.float32)
 
     def compute_spectrogram(self, eeg: np.ndarray):
@@ -175,7 +204,9 @@ class VentilationProcessor:
         Sxx_db = 10.0 * np.log10(Sxx[freq_mask, :] + 1e-12)
         return f, t_spec, Sxx_db
 
-    def compute_window_grid(self, t_common: np.ndarray, win_sec: float = 5.0, step_sec: float = 2.0) -> np.ndarray:
+    def compute_window_grid(
+        self, t_common: np.ndarray, win_sec: float = 5.0, step_sec: float = 2.0
+    ) -> np.ndarray:
         """Creates uniform sliding window center timestamps across the recording."""
         if len(t_common) == 0:
             return np.array([], dtype=np.float32)
@@ -270,8 +301,16 @@ class VentilationProcessor:
             local_valid = [records[j] for j in range(lo, hi) if records[j][2] is None]
             local_dts = [r[3] for r in local_valid]
             local_dps = [r[4][0] for r in local_valid]
-            cv_dt = float(np.std(local_dts) / np.mean(local_dts)) if len(local_dts) >= 3 and np.mean(local_dts) > 0 else 0.0
-            cv_dp = float(np.std(local_dps) / np.mean(local_dps)) if len(local_dps) >= 3 and np.mean(local_dps) > 0.5 else 0.0
+            cv_dt = (
+                float(np.std(local_dts) / np.mean(local_dts))
+                if len(local_dts) >= 3 and np.mean(local_dts) > 0
+                else 0.0
+            )
+            cv_dp = (
+                float(np.std(local_dps) / np.mean(local_dps))
+                if len(local_dps) >= 3 and np.mean(local_dps) > 0.5
+                else 0.0
+            )
 
             if not has_co2 and delta_p < 2.0 and p_min >= -0.4:
                 rid = REGIME_TO_ID["Apnea"]
@@ -293,7 +332,6 @@ class VentilationProcessor:
             mask = (t_windows >= t0) & (t_windows <= t1)
             window_labels[mask] = rid
 
-        # Gaps > 12s without breaths are marked Apnea
         if segments:
             if segments[0][0] - float(t_common[0]) > 12.0:
                 window_labels[t_windows < segments[0][0]] = REGIME_TO_ID["Apnea"]

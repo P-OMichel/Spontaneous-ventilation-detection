@@ -28,10 +28,17 @@ class EventMarker:
 class AnnotationStore:
     """Holds ground-truth ventilation regime labels, crop boundaries, events, and selective .npz I/O."""
 
-    def __init__(self, fs: int = 128, win_sec: float = 5.0, step_sec: float = 2.0):
+    def __init__(
+        self,
+        fs: int = 128,
+        win_sec: float = 5.0,
+        step_sec: float = 2.0,
+        max_duration_sec: float = 3600.0,
+    ):
         self.fs = fs
         self.win_sec = win_sec
         self.step_sec = step_sec
+        self.max_duration_sec = max_duration_sec
 
         self.sample_id: str = "uninitialized"
         self.source_path: str = ""
@@ -128,7 +135,7 @@ class AnnotationStore:
         fallback_initial_regimes_fn=None,
         hypnotic_tracks: List[dict] | None = None,
     ):
-        """Restores waveforms and any selectively saved ventilation annotation sections."""
+        """Restores waveforms (last `max_duration_sec` max) and selectively saved annotation sections."""
         with np.load(annotated_path, allow_pickle=False) as data:
             file_keys = set(data.files)
             meta = json.loads(str(data["metadata_json"]))
@@ -143,22 +150,49 @@ class AnnotationStore:
             )
             self.hypnotic_tracks = hypnotic_tracks if hypnotic_tracks is not None else []
 
-            self.t_common = data["t_common"].astype(np.float32)
-            self.awp_data = data["awp"].astype(np.float32)
-            self.co2_data = data["co2"].astype(np.float32)
-            self.eeg_data = data["eeg"].astype(np.float32) if "eeg" in file_keys else np.zeros_like(self.awp_data)
-            self.ecg_data = data["ecg"].astype(np.float32) if "ecg" in file_keys else np.zeros_like(self.awp_data)
-            self.compl_time = data["compl_time"].astype(np.float32) if "compl_time" in file_keys else np.array([], dtype=np.float32)
-            self.compl_val = data["compl_val"].astype(np.float32) if "compl_val" in file_keys else np.array([], dtype=np.float32)
+            t_all = data["t_common"].astype(np.float32)
+            t_max = float(t_all[-1]) if len(t_all) > 0 else 0.0
+            t_cutoff = (
+                (t_max - float(self.max_duration_sec))
+                if (self.max_duration_sec > 0 and len(t_all) > 0)
+                else -np.inf
+            )
+            s_mask = t_all >= t_cutoff
 
-            self.t_windows = data["t_windows"].astype(np.float32)
+            self.t_common = t_all[s_mask]
+            self.awp_data = data["awp"].astype(np.float32)[s_mask]
+            self.co2_data = data["co2"].astype(np.float32)[s_mask]
+            self.eeg_data = (
+                data["eeg"].astype(np.float32)[s_mask]
+                if "eeg" in file_keys
+                else np.zeros_like(self.awp_data)
+            )
+            self.ecg_data = (
+                data["ecg"].astype(np.float32)[s_mask]
+                if "ecg" in file_keys
+                else np.zeros_like(self.awp_data)
+            )
+
+            if "compl_time" in file_keys and "compl_val" in file_keys:
+                ct = data["compl_time"].astype(np.float32)
+                cv = data["compl_val"].astype(np.float32)
+                cp_mask = ct >= t_cutoff
+                self.compl_time = ct[cp_mask]
+                self.compl_val = cv[cp_mask]
+            else:
+                self.compl_time = np.array([], dtype=np.float32)
+                self.compl_val = np.array([], dtype=np.float32)
+
+            tw_all = data["t_windows"].astype(np.float32)
+            w_mask = tw_all >= t_cutoff
+            self.t_windows = tw_all[w_mask]
 
             # 1. Regime Labels
             has_regimes = saved_sections.get("regimes", "regime_labels" in file_keys) and (
                 "regime_labels" in file_keys
             )
             if has_regimes:
-                self.regimes = data["regime_labels"].astype(np.int32)
+                self.regimes = data["regime_labels"].astype(np.int32)[w_mask]
             elif fallback_initial_regimes_fn is not None:
                 self.regimes = fallback_initial_regimes_fn(
                     self.t_common, self.awp_data, self.co2_data, self.t_windows
@@ -166,18 +200,18 @@ class AnnotationStore:
             else:
                 self.regimes = np.full(len(self.t_windows), REGIME_TO_ID["Unknown"], dtype=np.int32)
 
-            # 2. Crop Boundaries
+            # 2. Crop Boundaries (clamped inside the loaded window)
             min_t = float(self.t_common[0]) if len(self.t_common) > 0 else 0.0
             max_t = float(self.t_common[-1]) if len(self.t_common) > 0 else 0.0
             has_crop = saved_sections.get("crop", "crop_start_sec" in meta)
             if has_crop:
-                self.keep_start_sec = float(meta.get("crop_start_sec", min_t))
-                self.keep_end_sec = float(meta.get("crop_end_sec", max_t))
+                self.keep_start_sec = max(min_t, float(meta.get("crop_start_sec", min_t)))
+                self.keep_end_sec = min(max_t, float(meta.get("crop_end_sec", max_t)))
             else:
                 self.keep_start_sec = min_t
                 self.keep_end_sec = max_t
 
-            # 3. Transition Events
+            # 3. Transition Events inside loaded window
             has_events = saved_sections.get(
                 "events",
                 ("spont_onset_times" in file_keys) or ("extubation_times" in file_keys),
@@ -185,9 +219,11 @@ class AnnotationStore:
             self.events.clear()
             if has_events:
                 for t_sp in data.get("spont_onset_times", []):
-                    self.events.append(EventMarker(time=float(t_sp), event_type="spont_onset"))
+                    if min_t <= float(t_sp) <= max_t:
+                        self.events.append(EventMarker(time=float(t_sp), event_type="spont_onset"))
                 for t_ex in data.get("extubation_times", []):
-                    self.events.append(EventMarker(time=float(t_ex), event_type="extubation"))
+                    if min_t <= float(t_ex) <= max_t:
+                        self.events.append(EventMarker(time=float(t_ex), event_type="extubation"))
 
             self.loaded_sections = {
                 "regimes": bool(has_regimes),
