@@ -133,7 +133,6 @@ class VentilationProcessor:
         with np.load(file_path, allow_pickle=True) as data:
             file_keys = set(data.files)
 
-            # Determine cutoff so hypnotic tracks match the loaded last-1h window
             t_cutoff = -np.inf
             if self.max_duration_sec > 0:
                 if "t_common" in file_keys and len(data["t_common"]) > 0:
@@ -224,7 +223,7 @@ class VentilationProcessor:
         t_windows: np.ndarray,
     ) -> np.ndarray:
         """
-        Proposes initial integer regime IDs on `t_windows` using CO2-anchored breath morphology:
+        Proposes initial integer regime IDs on `t_windows`:
           0: Controlled
           1: Unknown
           2: Apnea
@@ -235,72 +234,73 @@ class VentilationProcessor:
         if n_win == 0 or len(t_common) < int(self.fs * 5):
             return np.full(n_win, REGIME_TO_ID["Unknown"], dtype=np.int32)
 
-        win_smooth = max(1, int(round(0.04 * self.fs)))
+        win_smooth = max(1, int(round(0.05 * self.fs)))
         v_p_smooth = np.convolve(awp, np.ones(win_smooth) / win_smooth, mode="same")
 
-        # 1. Hysteresis CO2 expiratory upstroke detection
-        breath_anchors = []
+        # 1. Detect breath cycles using CO2 expiratory upstrokes (hysteresis 10 -> 4 mmHg)
+        cycle_times = []
         armed = True
         last_t = -np.inf
         for idx in range(len(co2)):
             if armed and co2[idx] > 10.0 and (t_common[idx] - last_t) >= 1.2:
-                look_lo = max(0, idx - int(2.5 * self.fs))
-                vc_back = co2[look_lo:idx]
-                tc_back = t_common[look_lo:idx]
-                low_pts = np.where(vc_back < 4.0)[0]
-                t_insp = float(tc_back[low_pts[-1]]) if len(low_pts) > 0 else float(t_common[idx] - 1.2)
-                breath_anchors.append((t_insp, float(t_common[idx]), True))
+                cycle_times.append(float(t_common[idx]))
                 last_t = float(t_common[idx])
                 armed = False
             elif not armed and co2[idx] < 4.0:
                 armed = True
 
-        if len(breath_anchors) < 3:
+        has_co2_track = len(cycle_times) >= 3
+        if not has_co2_track:
             peaks, _ = signal.find_peaks(v_p_smooth, prominence=2.5, distance=int(1.5 * self.fs))
-            breath_anchors = [(float(t_common[pk] - 0.8), float(t_common[pk] + 0.5), False) for pk in peaks]
+            cycle_times = [float(t_common[pk]) for pk in peaks]
 
-        if len(breath_anchors) < 2:
+        if len(cycle_times) < 2:
             return np.full(n_win, REGIME_TO_ID["Apnea"], dtype=np.int32)
 
-        # 2. Extract breath features
+        # 2. Extract full-cycle AWP features (unaffected by CO2 transit lag)
         records = []
-        for i in range(len(breath_anchors)):
-            t_insp, t_exp, has_co2 = breath_anchors[i]
-            t0 = breath_anchors[i - 1][1] if i > 0 else max(float(t_common[0]), t_insp - 2.0)
-            t1 = t_exp
-            dt = (t_exp - breath_anchors[i - 1][1]) if i > 0 else 4.0
+        for i in range(1, len(cycle_times)):
+            t0 = cycle_times[i - 1]
+            t1 = cycle_times[i]
+            dt = t1 - t0
 
             if dt > 12.0:
                 records.append((t0, t1, REGIME_TO_ID["Apnea"], dt, None))
                 continue
 
-            b0 = np.searchsorted(t_common, max(t0, t_insp - 0.5))
-            b1 = np.searchsorted(t_common, t_insp + 0.05)
-            i0 = np.searchsorted(t_common, max(t0, t_insp - 0.25))
-            i1 = np.searchsorted(t_common, t_exp)
-            if i1 - i0 < int(0.3 * self.fs):
+            i0 = np.searchsorted(t_common, t0)
+            i1 = np.searchsorted(t_common, t1)
+            if i1 - i0 < int(0.4 * self.fs):
                 continue
 
-            seg = v_p_smooth[i0:i1]
-            peep = float(np.median(v_p_smooth[b0:b1])) if b1 > b0 else float(np.percentile(seg, 15))
-            p_peak = float(np.max(seg))
-            p_min = float(np.min(seg))
-            delta_p = p_peak - peep
-            neg_dip = peep - p_min
-            records.append((t0, t1, None, dt, (delta_p, neg_dip, p_min, has_co2)))
+            seg_p = v_p_smooth[i0:i1]
+            seg_c = co2[i0:i1]
 
-        # 3. Classify each breath segment
+            # True expiratory baseline PEEP (15th percentile of full respiratory cycle)
+            peep = float(np.percentile(seg_p, 15))
+            p_peak = float(np.percentile(seg_p, 98))
+            p_min = float(np.min(seg_p))
+            delta_p = p_peak - peep          # Positive pressure support above PEEP
+            neg_dip = peep - p_min           # Negative inspiratory effort below PEEP
+            etco2 = float(np.percentile(seg_c, 95)) if has_co2_track else 35.0
+
+            records.append((t0, t1, None, dt, (delta_p, neg_dip, p_min, etco2)))
+
+        # 3. Classify each respiratory cycle
         segments = []
         for i, (t0, t1, preset_id, dt, feats) in enumerate(records):
             if preset_id is not None:
                 segments.append((t0, t1, preset_id))
                 continue
 
-            delta_p, neg_dip, p_min, has_co2 = feats
+            delta_p, neg_dip, p_min, etco2 = feats
+
+            # Local 5-breath timing & pressure variability
             lo, hi = max(0, i - 2), min(len(records), i + 3)
             local_valid = [records[j] for j in range(lo, hi) if records[j][2] is None]
             local_dts = [r[3] for r in local_valid]
             local_dps = [r[4][0] for r in local_valid]
+
             cv_dt = (
                 float(np.std(local_dts) / np.mean(local_dts))
                 if len(local_dts) >= 3 and np.mean(local_dts) > 0
@@ -308,19 +308,29 @@ class VentilationProcessor:
             )
             cv_dp = (
                 float(np.std(local_dps) / np.mean(local_dps))
-                if len(local_dps) >= 3 and np.mean(local_dps) > 0.5
+                if len(local_dps) >= 3 and np.mean(local_dps) > 1.0
                 else 0.0
             )
 
-            if not has_co2 and delta_p < 2.0 and p_min >= -0.4:
+            # A. Apnea / Disconnected: no meaningful pressure swing and low/absent CO2
+            if delta_p < 1.5 and neg_dip < 0.25 and etco2 < 12.0:
                 rid = REGIME_TO_ID["Apnea"]
-            elif delta_p < 3.5 and (neg_dip > 0.25 or p_min < -0.25 or has_co2):
-                if cv_dt <= 0.18 and 3.0 <= dt <= 7.5:
+
+            # B. Unassisted Spontaneous Ventilation:
+            #    Low positive pressure swing (< 4.5 hPa) WITH negative inspiratory pull
+            elif delta_p < 4.5 and (neg_dip > 0.25 or p_min < -0.25):
+                if cv_dt <= 0.16 and 2.5 <= dt <= 7.5 and etco2 >= 25.0:
                     rid = REGIME_TO_ID["Efficient spontaneous ventilation"]
                 else:
                     rid = REGIME_TO_ID["Transition to Spontaneous ventilation"]
-            elif neg_dip > 0.30 or cv_dt > 0.12 or cv_dp > 0.15:
+
+            # C. Assisted / PSV / Bucking / Manual Bagging:
+            #    Positive pressure support (>= 4.5 hPa) WITH patient trigger dip or irregular timing/pressure
+            elif neg_dip > 0.45 or cv_dt > 0.10 or cv_dp > 0.14:
                 rid = REGIME_TO_ID["Transition to Spontaneous ventilation"]
+
+            # D. Controlled Mechanical Ventilation:
+            #    Steady positive driving pressure (>= 4.5 hPa), regular rate, no trigger dip
             else:
                 rid = REGIME_TO_ID["Controlled"]
 

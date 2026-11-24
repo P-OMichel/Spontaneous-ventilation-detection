@@ -5,7 +5,6 @@ from Annotation_App.processing import VentilationProcessor
 from Annotation_App.annotations import AnnotationStore
 from Annotation_App.ui_window import VentilationAnnotatorWindow
 
-
 def main():
     fs = 128
     win_sec = 5.0
