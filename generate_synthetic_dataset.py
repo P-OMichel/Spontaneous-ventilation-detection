@@ -1,7 +1,8 @@
+import os
+import json
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 REGIME_NAMES = {
     0: "Controlled",
@@ -11,24 +12,17 @@ REGIME_NAMES = {
     4: "Unknown / Artifact",
 }
 
-REGIME_COLORS = {
-    0: "#1f4e78",  # Controlled (Steel Blue)
-    1: "#7f6000",  # Transition (Amber / Brown)
-    2: "#1e5631",  # Efficient Spontaneous (Dark Green)
-    3: "#661d1d",  # Apnea (Deep Red)
-    4: "#4a4a4a",  # Unknown / Artifact (Charcoal Grey)
-}
 
-
-def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
+def generate_synthetic_case(duration_sec=500, fs=128, seed=None):
     """
-    Generates coupled synthetic anesthesia waveforms (CO2, AWP, Cdyn) modeled on
-    real VitalDB / Primus emergence trajectories, including:
-      - Wide, flat or upward-sloping CO2 top plateaus (breath-holds / slow expiration)
-      - Deep mid-plateau curare clefts & double-humped plateaus
-      - Incomplete-washout stacked breaths ('W'/'M' clusters)
-      - Post-pause hypercapnic CO2 overshoot
-      - Manual bag squeeze spikes & sudden Cdyn step drops
+    Generates coupled synthetic anesthesia waveforms (CO2, AWP, Cdyn) at 128 Hz,
+    including enriched Unknown / Artifact regimes (~12-18% prevalence) featuring:
+      - Absurd out-of-bounds values (high-vacuum suctioning, over-pressure spikes, CO2 rail clipping)
+      - Cross-channel physiological impossibilities:
+          * Active VCV pressure waves with flat 0 CO2 (sampling line disconnect / bypass)
+          * Active CO2 waveforms with flat 0 AWP (pressure line disconnect / transducer fault)
+          * Uncoupled / chaotic surgical & electrocautery interference
+          * Frozen non-zero sensor flatlines
     """
     rng = np.random.default_rng(seed)
     n_samples = int(duration_sec * fs)
@@ -41,28 +35,38 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
     co2_lag_samples = int(rng.uniform(1.0, 2.2) * fs)
     alv_co2_base = rng.uniform(36.0, 42.0)
 
-    # 1. Build a rich, realistic clinical trajectory (mirrors your 5 screenshots)
+    # 1. Build clinical trajectory templates with higher Artifact representation
     labels = np.zeros(n_samples, dtype=int)
     cursor = 0
     trajectory_templates = [
-        # Template A: Smooth emergence with intermittent apnea & final extubation (like 3600-3800 & 20340-20900)
+        # Template A: Artifact during Controlled phase + standard emergence
         [
-            (0, rng.uniform(110, 160)),  # Controlled
-            (1, rng.uniform(45, 75)),    # Transition (bagging + wide clefted plateaus)
-            (2, rng.uniform(80, 130)),   # Efficient Spontaneous
-            (3, rng.uniform(15, 28)),    # Brief Apnea
-            (2, rng.uniform(12, 22)),    # Pre-extubation cough/breath cluster
-            (3, rng.uniform(25, 45)),    # Post-extubation Apnea
+            (0, rng.uniform(60, 90)),    # Controlled
+            (4, rng.uniform(25, 45)),    # Unknown / Artifact (e.g., sampling line clog or suctioning)
+            (0, rng.uniform(50, 80)),    # Controlled resumes
+            (1, rng.uniform(45, 70)),    # Transition
+            (2, rng.uniform(75, 115)),   # Efficient Spontaneous
+            (3, rng.uniform(25, 45)),    # Extubation Apnea
         ],
-        # Template B: Multi-stage emergence with rescue bagging & artifact (like 14600-15150 & 10600-10900)
+        # Template B: Multi-artifact emergence (suctioning, transducer fault, rescue bagging)
         [
+            (0, rng.uniform(85, 120)),   # Controlled
+            (1, rng.uniform(40, 65)),    # Transition 1
+            (4, rng.uniform(25, 45)),    # Unknown / Artifact 1
+            (3, rng.uniform(15, 25)),    # Apnea pause
+            (1, rng.uniform(35, 55)),    # Transition 2
+            (2, rng.uniform(65, 100)),   # Efficient Spontaneous
+            (4, rng.uniform(20, 35)),    # Unknown / Artifact 2 (e.g., open-air CO2 without AWP)
+            (3, rng.uniform(25, 45)),    # Extubation Apnea
+        ],
+        # Template C: Early artifact + chaotic emergence + spontaneous recovery
+        [
+            (4, rng.uniform(20, 35)),    # Unknown / Artifact (induction / esophageal / sensor check)
             (0, rng.uniform(90, 130)),   # Controlled
-            (1, rng.uniform(45, 70)),    # Transition 1
-            (3, rng.uniform(18, 30)),    # Apnea pause
-            (4, rng.uniform(12, 22)),    # Unknown / Mask leak or suctioning
-            (1, rng.uniform(35, 60)),    # Transition 2 (rescue bagging + long plateaus)
-            (2, rng.uniform(70, 110)),   # Efficient Spontaneous
-            (3, rng.uniform(25, 50)),    # Extubation Apnea
+            (1, rng.uniform(50, 80)),    # Transition
+            (4, rng.uniform(25, 40)),    # Unknown / Artifact (suctioning / leak)
+            (2, rng.uniform(80, 120)),   # Efficient Spontaneous
+            (3, rng.uniform(25, 45)),    # Apnea
         ],
     ]
     sequence = trajectory_templates[rng.integers(0, len(trajectory_templates))]
@@ -74,15 +78,14 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
         if cursor >= n_samples:
             break
 
-    # Direct waveform buffers (allows explicit control of top-plateau shapes)
     awp = np.zeros(n_samples)
     co2 = np.zeros(n_samples)
-    vt_proxy = np.zeros(n_samples)   # Tracks delivered/inhaled tidal volume for Cdyn
-    pmus_proxy = np.zeros(n_samples) # Tracks patient muscular effort
+    vt_proxy = np.zeros(n_samples)
+    pmus_proxy = np.zeros(n_samples)
 
     # 2. Synthesize breath-by-breath waveforms per regime
     idx = 0
-    hypercapnia_offset = 0.0  # Builds up during apnea/hypoventilation, washes out during good breathing
+    hypercapnia_offset = 0.0
 
     while idx < n_samples:
         state = labels[idx]
@@ -99,22 +102,17 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
             vt = rng.uniform(0.45, 0.55)
             flow_insp = vt / ti
 
-            # AWP: Classic VCV sawtooth rise to Ppeak + PEEP
-            awp_cycle = np.where(
+            awp[idx:end] = np.where(
                 t_loc <= ti,
                 peep_set + R_rs * flow_insp + (flow_insp * t_loc / C_rs),
                 peep_set + (vt / C_rs) * np.exp(-(t_loc - ti) / (R_rs * C_rs)) * 0.4,
             )
-            awp[idx:end] = awp_cycle
 
-            # CO2: Uniform flat-topped square-wave plateau
-            # Note: CO2 rises during expiration (after ti) and drops to 0 during next inspiration
             co2_target = alv_co2_base + hypercapnia_offset
             hypercapnia_offset = max(0.0, hypercapnia_offset - 1.5)
 
             t_exp = np.maximum(0.0, t_loc - ti)
             exp_dur = max(0.2, dur_s - ti)
-            # Crisp S-upstroke, completely flat top plateau, sharp drop at end of expiration
             upstroke = 1.0 - np.exp(-t_exp / 0.14)
             washout = 1.0 / (1.0 + np.exp((t_exp - (exp_dur - 0.18)) / 0.03))
             co2[idx:end] = np.where(t_loc <= ti, 0.0, co2_target * upstroke * washout)
@@ -122,7 +120,7 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
             vt_proxy[idx:end] = vt * 1000.0
             idx = end
 
-        # --- STATE 1: TRANSITION (5 Real Clinical Top-Plateau Sub-Patterns) ---
+        # --- STATE 1: TRANSITION (Wide Plateaus, Clefts, Stacking & Bagging) ---
         elif state == 1:
             sub_pattern = rng.choice(
                 ["wide_plateau", "curare_cleft", "stacked_cluster", "manual_bagging"],
@@ -130,24 +128,20 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
             )
 
             if sub_pattern == "wide_plateau":
-                # Pattern 1 (like 3725-3737 & 14875-14893): Prolonged 4.5-8.5s flat or rising top plateau
                 dur_s = rng.uniform(4.5, 8.5)
                 end = min(n_samples, idx + int(dur_s * fs))
                 t_loc = np.linspace(0, (end - idx) / fs, end - idx)
                 ti = rng.uniform(0.45, 0.75)
 
-                # Small negative inspiratory gasp on AWP, then quiet baseline during breath-hold
                 awp[idx:end] = np.where(
                     t_loc <= ti,
                     -rng.uniform(2.5, 5.5) * np.sin(np.pi * t_loc / ti),
                     rng.uniform(0.0, 1.5),
                 )
 
-                # CO2 stays pinned at the top plateau for several seconds, climbing slightly
                 t_exp = np.maximum(0.0, t_loc - ti)
                 exp_dur = max(0.5, (end - idx) / fs - ti)
                 upstroke = 1.0 - np.exp(-t_exp / 0.18)
-                # Gradual upward slope across the long top plateau (+4 to +9 mmHg)
                 plateau_ramp = (alv_co2_base + hypercapnia_offset) + rng.uniform(4.0, 9.0) * (t_exp / exp_dur)
                 washout = 1.0 / (1.0 + np.exp((t_exp - (exp_dur - 0.15)) / 0.03))
                 co2[idx:end] = np.where(t_loc <= ti, 0.0, plateau_ramp * upstroke * washout)
@@ -157,7 +151,6 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
                 idx = end
 
             elif sub_pattern == "curare_cleft":
-                # Pattern 2 (like 20615-20645 & 5195-5205): Broad top plateau split by 1 or 2 sharp V-clefts
                 dur_s = rng.uniform(3.8, 6.5)
                 end = min(n_samples, idx + int(dur_s * fs))
                 t_loc = np.linspace(0, (end - idx) / fs, end - idx)
@@ -169,17 +162,15 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
                 washout = 1.0 / (1.0 + np.exp((t_exp - (exp_dur - 0.15)) / 0.03))
                 base_top = alv_co2_base + hypercapnia_offset + rng.uniform(1.0, 5.0)
 
-                # Carve 1 or 2 deep downward clefts into the top plateau
                 cleft_factor = np.ones_like(t_loc)
                 awp_cleft = np.zeros_like(t_loc)
                 n_clefts = rng.choice([1, 2], p=[0.7, 0.3])
                 for c in range(n_clefts):
                     c_center = ti + exp_dur * rng.uniform(0.28 + 0.3 * c, 0.50 + 0.25 * c)
                     c_width = rng.uniform(0.14, 0.26)
-                    c_depth = rng.uniform(0.45, 0.85)  # Plunges 45-85% down from plateau top
+                    c_depth = rng.uniform(0.45, 0.85)
                     notch = c_depth * np.exp(-((t_loc - c_center) ** 2) / (2 * c_width ** 2))
                     cleft_factor -= notch
-                    # Corresponding negative diaphragmatic dip on AWP
                     awp_cleft -= rng.uniform(2.0, 4.5) * np.exp(-((t_loc - c_center) ** 2) / (2 * c_width ** 2))
 
                 awp[idx:end] = (
@@ -193,7 +184,6 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
                 idx = end
 
             elif sub_pattern == "stacked_cluster":
-                # Pattern 3 (like 3685-3715 & 14685-14714): Rapid, erratic breaths with incomplete washout
                 n_breaths = rng.integers(3, 6)
                 for b in range(n_breaths):
                     if idx >= n_samples or labels[idx] != 1:
@@ -203,7 +193,6 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
                     t_loc = np.linspace(0, (end - idx) / fs, end - idx)
                     ti = 0.35 * b_dur
 
-                    # Incomplete inspiratory washout: baseline stays elevated at 6-18 mmHg
                     elevated_base = rng.uniform(6.0, 18.0) if b > 0 else 0.0
                     peak_h = rng.uniform(24.0, 42.0)
 
@@ -218,7 +207,6 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
                     idx = end
 
             else:  # "manual_bagging"
-                # Pattern 4 (like 3664-3680 & 5131-5146): High-pressure bag squeezes + asynchronous CO2
                 n_squeezes = rng.integers(2, 5)
                 for _ in range(n_squeezes):
                     if idx >= n_samples or labels[idx] != 1:
@@ -228,13 +216,11 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
                     t_loc = np.linspace(0, (end - idx) / fs, end - idx)
                     ti = rng.uniform(0.5, 0.8)
 
-                    # Large manual bag spike (22-42 hPa) + pre-trigger dip
                     bag_peak = rng.uniform(22.0, 42.0)
                     p_bag = bag_peak * np.exp(-((t_loc - ti) ** 2) / 0.035)
                     p_dip = rng.uniform(2.5, 5.5) * np.exp(-((t_loc - ti * 0.4) ** 2) / 0.01)
                     awp[idx:end] = rng.uniform(0.5, 3.0) + p_bag - p_dip
 
-                    # Irregular CO2 peak
                     t_exp = np.maximum(0.0, t_loc - ti)
                     exp_dur = max(0.3, b_dur - ti)
                     co2_amp = rng.uniform(28.0, 46.0)
@@ -247,7 +233,6 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
 
         # --- STATE 2: EFFICIENT SPONTANEOUS VENTILATION ---
         elif state == 2:
-            # Pattern (like 20668-20822 & 10785-10842): Steady rhythm, rounded dome/plateau, 0 hPa AWP ripples
             rr = rng.uniform(15.0, 20.0)
             cycle_len = int((60.0 / rr) * rng.normal(1.0, 0.06) * fs)
             end = min(n_samples, idx + max(int(1.6 * fs), cycle_len))
@@ -255,7 +240,6 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
             t_loc = np.linspace(0, dur_s, end - idx)
             ti = 0.38 * dur_s
 
-            # Symmetrical low-amplitude sinusoidal pressure swings around 0 hPa (+/- 2 to 3.5 hPa)
             amp_awp = rng.uniform(2.0, 3.5)
             awp[idx:end] = np.where(
                 t_loc <= ti,
@@ -263,7 +247,6 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
                 (amp_awp * 0.85) * np.sin(np.pi * (t_loc - ti) / (dur_s - ti)),
             )
 
-            # Rounded / slightly domed full-height alveolar plateau returning cleanly to 0
             co2_target = alv_co2_base + hypercapnia_offset
             hypercapnia_offset = max(0.0, hypercapnia_offset - 1.2)
 
@@ -285,19 +268,86 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
             hypercapnia_offset = min(10.0, hypercapnia_offset + 0.35)
             idx += step
 
-        # --- STATE 4: UNKNOWN / ARTIFACT (AWP Spikes + Flat 0 CO2) ---
+        # --- STATE 4: UNKNOWN / ARTIFACT (Absurd Values & Physiological Contradictions) ---
         elif state == 4:
-            step = min(n_samples - idx, int(rng.uniform(1.5, 3.0) * fs))
-            t_loc = np.linspace(0, step / fs, step)
-            spike = rng.uniform(10.0, 24.0) * np.exp(-((t_loc - 0.35) ** 2) / 0.025)
-            awp[idx:idx + step] = spike
-            co2[idx:idx + step] = 0.0  # Occluded sampling line / mask leak / esophageal
-            idx += step
+            # Find the full contiguous length of this Artifact block so one coherent fault occurs
+            block_end = idx
+            while block_end < n_samples and labels[block_end] == 4:
+                block_end += 1
+            block_len = block_end - idx
+            dur_s = block_len / fs
+            t_loc = np.linspace(0, dur_s, block_len)
 
-    # Apply realistic side-stream CO2 sampling lag & mild smoothing
-    co2 = np.roll(co2, co2_lag_samples)
-    co2[:co2_lag_samples] = 0.0
-    co2 = gaussian_filter1d(co2, sigma=3)
+            artifact_type = rng.choice([
+                "paw_active_co2_zero",     # Mechanical pressure waves with flat 0 CO2 (sampling clog / esophageal)
+                "co2_active_paw_zero",     # Normal CO2 waves with flat 0 AWP (transducer disconnect / room air)
+                "absurd_paw_spikes",       # Over-pressure / high-vacuum suctioning (+60 to +105 or -25 hPa)
+                "absurd_co2_rail",         # Capnograph sensor fault pinned at absurd 85-125 mmHg
+                "uncoupled_cpr_cautery",   # High-frequency / anti-phase oscillations impossible physiologically
+                "frozen_non_zero",         # Flatlined non-zero stuck sensor values
+            ])
+
+            if artifact_type == "paw_active_co2_zero":
+                # Regular VCV-like pressure cycles (15-24 hPa), but CO2 is completely dead at 0 mmHg
+                freq = rng.uniform(0.2, 0.28)
+                phase = (t_loc * freq) % 1.0
+                awp[idx:block_end] = np.where(
+                    phase < 0.35,
+                    peep_set + rng.uniform(16.0, 24.0) * (phase / 0.35),
+                    peep_set + 3.0 * np.exp(-(phase - 0.35) * 6.0),
+                )
+                co2[idx:block_end] = 0.0
+
+            elif artifact_type == "co2_active_paw_zero":
+                # Normal-looking CO2 waves (35-44 mmHg), but AWP is completely flat at 0.0 hPa
+                freq = rng.uniform(0.22, 0.32)
+                phase = (t_loc * freq) % 1.0
+                awp[idx:block_end] = 0.0
+                co2[idx:block_end] = np.where(
+                    phase < 0.35,
+                    0.0,
+                    alv_co2_base * (1.0 - np.exp(-(phase - 0.35) * 14.0)),
+                )
+
+            elif artifact_type == "absurd_paw_spikes":
+                # Extreme non-physiological pressures: over-pressurization (+60..+105 hPa) or suction (-15..-30 hPa)
+                awp[idx:block_end] = rng.uniform(0.0, 2.0)
+                n_events = max(2, int(dur_s / 3.0))
+                for _ in range(n_events):
+                    center = rng.uniform(0.5, max(0.6, dur_s - 0.5))
+                    width = rng.uniform(0.15, 0.45)
+                    if rng.random() < 0.65:
+                        amp = rng.uniform(60.0, 105.0)   # Absurd positive pressure spike
+                    else:
+                        amp = -rng.uniform(15.0, 30.0)   # Deep endotracheal suction vacuum
+                    awp[idx:block_end] += amp * np.exp(-((t_loc - center) ** 2) / (2 * width ** 2))
+                co2[idx:block_end] = 0.0
+
+            elif artifact_type == "absurd_co2_rail":
+                # Capnograph rails at absurdly high 85-125 mmHg while AWP shows random/normal ripples
+                co2[idx:block_end] = rng.uniform(85.0, 125.0) + rng.normal(0, 1.5, block_len)
+                awp[idx:block_end] = rng.uniform(2.0, 8.0) * np.sin(2 * np.pi * 0.25 * t_loc)
+
+            elif artifact_type == "uncoupled_cpr_cautery":
+                # Rapid chest compressions / surgical compression (1.5 - 2.2 Hz) uncoupled from CO2
+                cpr_freq = rng.uniform(1.5, 2.2)
+                awp[idx:block_end] = rng.uniform(12.0, 28.0) * np.maximum(0.0, np.sin(2 * np.pi * cpr_freq * t_loc))
+                # Low, erratic pseudo-CO2 ripples at an unrelated slow frequency
+                co2[idx:block_end] = rng.uniform(6.0, 14.0) * (0.5 + 0.5 * np.sin(2 * np.pi * 0.12 * t_loc))
+
+            else:  # "frozen_non_zero"
+                # Stuck sensor line holding impossible non-zero static values
+                awp[idx:block_end] = rng.uniform(14.0, 28.0)
+                co2[idx:block_end] = rng.uniform(25.0, 42.0)
+
+            idx = block_end
+
+    # Apply realistic side-stream CO2 sampling lag & mild smoothing (preserve sharp artifacts)
+    co2_shifted = np.roll(co2, co2_lag_samples)
+    co2_shifted[:co2_lag_samples] = 0.0
+    # Keep Artifact blocks unlagged/unblurred where CO2 is explicitly forced to 0 or railed
+    artifact_mask = labels == 4
+    co2 = np.where(artifact_mask, co2, gaussian_filter1d(co2_shifted, sigma=3))
 
     # 3. Simulate Sample-and-Hold Dynamic Compliance (updated every 8 seconds)
     cdyn = np.zeros(n_samples)
@@ -305,124 +355,119 @@ def generate_synthetic_case(duration_sec=550, fs=128, seed=None):
     last_cdyn = C_rs * 1000.0
     for start in range(0, n_samples, update_step):
         end = min(n_samples, start + update_step)
-        delta_p = np.max(awp[start:end]) - np.min(awp[start:end])
-        mean_vt = np.mean(vt_proxy[start:end])
-        if delta_p > 5.0 and mean_vt > 100.0:
-            # Drops during irregular transition/bagging or stabilizes during VCV
-            effort_factor = 0.65 if np.mean(pmus_proxy[start:end]) > 1.0 else 1.0
-            last_cdyn = np.clip((mean_vt / delta_p) * effort_factor, 14.0, 95.0)
+        # During artifact blocks, Cdyn either freezes or jumps to absurd values (>150 or <5)
+        if np.mean(labels[start:end] == 4) > 0.5:
+            if rng.random() < 0.4:
+                last_cdyn = rng.choice([rng.uniform(2.0, 6.0), rng.uniform(160.0, 240.0)])
+        else:
+            delta_p = np.max(awp[start:end]) - np.min(awp[start:end])
+            mean_vt = np.mean(vt_proxy[start:end])
+            if delta_p > 5.0 and mean_vt > 100.0:
+                effort_factor = 0.65 if np.mean(pmus_proxy[start:end]) > 1.0 else 1.0
+                last_cdyn = np.clip((mean_vt / delta_p) * effort_factor, 14.0, 95.0)
         cdyn[start:end] = last_cdyn
 
-    # Add realistic baseline sensor noise
-    awp += rng.normal(0, 0.25, n_samples)
-    co2 = np.maximum(0.0, co2 + rng.normal(0, 0.2, n_samples))
+    # Add baseline sensor noise (except on frozen sensor artifacts)
+    frozen_mask = (np.gradient(awp) == 0) & (labels == 4)
+    awp = np.where(frozen_mask, awp, awp + rng.normal(0, 0.25, n_samples))
+    co2 = np.where(frozen_mask, co2, np.maximum(0.0, co2 + rng.normal(0, 0.2, n_samples)))
 
     return t, co2, awp, cdyn, labels
 
 
-def plot_sample_gallery(seeds=(12, 42, 108, 256), duration_sec=480, fs=128):
-    """
-    Generates and plots 4 different synthetic anesthesia emergence cases
-    in a 2x2 grid (CO2 + AWP + Regime Shading) plus a bottom row zooming
-    specifically into each case's Transition window.
-    """
-    plt.style.use("dark_background")
-    fig = plt.figure(figsize=(20, 14))
-    fig.patch.set_facecolor("#121212")
-
-    # Outer grid: 2 columns x 3 rows
-    # Rows 0 & 1: Full-case overview (CO2 on top, AWP on bottom) for 4 seeds
-    # Row 2: Zoomed-in Transition top-plateau morphology for each of the 4 seeds
-    outer_gs = fig.add_gridspec(3, 2, height_ratios=[1.2, 1.2, 1.0], hspace=0.35, wspace=0.14)
-
-    for idx, seed in enumerate(seeds[:4]):
-        t, co2, awp, cdyn, labels = generate_synthetic_case(
-            duration_sec=duration_sec, fs=fs, seed=seed
-        )
-
-        # Place first 4 cases in the top 2x2 grid
-        row, col = divmod(idx, 2)
-        inner_gs = outer_gs[row, col].subgridspec(2, 1, height_ratios=[1.0, 1.2], hspace=0.08)
-
-        ax_co2 = fig.add_subplot(inner_gs[0])
-        ax_awp = fig.add_subplot(inner_gs[1], sharex=ax_co2)
-
-        for ax in (ax_co2, ax_awp):
-            ax.set_facecolor("#181818")
-            ax.grid(True, color="#2a2a2a", linewidth=0.5)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            ax.spines["left"].set_color("#444444")
-            ax.spines["bottom"].set_color("#444444")
-            ax.tick_params(colors="#aaaaaa", labelsize=8)
-
-        ax_co2.plot(t, co2, color="#29b6f6", linewidth=1.0)
-        ax_co2.set_ylabel("CO2", fontsize=8.5, color="#cccccc")
-        ax_co2.set_ylim(-2, max(56, np.max(co2) * 1.12))
-        ax_co2.set_title(f"Sample Seed #{seed} — Full Trajectory Overview", fontsize=10, color="#eeeeee", pad=4)
-        plt.setp(ax_co2.get_xticklabels(), visible=False)
-
-        ax_awp.axhline(0, color="#888888", linestyle="--", linewidth=0.7)
-        ax_awp.plot(t, awp, color="#f5f5f5", linewidth=0.85)
-        ax_awp.set_ylabel("AWP", fontsize=8.5, color="#cccccc")
-        ax_awp.set_xlabel("Time (s)", fontsize=8.5, color="#aaaaaa")
-
-        # Shade contiguous regimes
-        change_idx = np.where(np.diff(labels) != 0)[0] + 1
-        seg_starts = np.concatenate(([0], change_idx))
-        seg_ends = np.concatenate((change_idx, [len(labels) - 1]))
-
-        for s, e in zip(seg_starts, seg_ends):
-            color = REGIME_COLORS[labels[s]]
-            ax_awp.axvspan(t[s], t[e], color=color, alpha=0.45)
-            ax_co2.axvspan(t[s], t[e], color=color, alpha=0.15)
-
-    # Bottom Row: Side-by-side zoomed inspection of Transition CO2 top plateaus across all 4 seeds
-    zoom_gs = outer_gs[2, :].subgridspec(1, 4, wspace=0.14)
-    for idx, seed in enumerate(seeds[:4]):
-        t, co2, awp, _, labels = generate_synthetic_case(
-            duration_sec=duration_sec, fs=fs, seed=seed
-        )
-        trans_indices = np.where(labels == 1)[0]
-        ax_zoom = fig.add_subplot(zoom_gs[0, idx])
-        ax_zoom.set_facecolor("#181818")
-        ax_zoom.grid(True, color="#2a2a2a", linewidth=0.5)
-
-        if len(trans_indices) > 0:
-            # Zoom into a 35-second slice inside the first Transition regime
-            start_i = trans_indices[0]
-            end_i = min(len(t) - 1, start_i + int(35 * fs))
-            ax_zoom.plot(t[start_i:end_i], co2[start_i:end_i], color="#29b6f6", linewidth=1.3)
-            ax_zoom.axvspan(t[start_i], t[end_i], color=REGIME_COLORS[1], alpha=0.2)
-            ax_zoom.set_ylim(-2, 58)
-            ax_zoom.set_title(f"Seed #{seed}: Transition CO2 Zoom (35s)", fontsize=9, color="#ffd54f")
-            ax_zoom.set_xlabel("Time (s)", fontsize=8, color="#aaaaaa")
-            if idx == 0:
-                ax_zoom.set_ylabel("CO2 (mmHg)", fontsize=8.5, color="#cccccc")
-
-        ax_zoom.spines["top"].set_visible(False)
-        ax_zoom.spines["right"].set_visible(False)
-        ax_zoom.spines["left"].set_color("#444444")
-        ax_zoom.spines["bottom"].set_color("#444444")
-        ax_zoom.tick_params(colors="#aaaaaa", labelsize=8)
-
-    # Global Legend at the top
-    patches = [
-        mpatches.Patch(color=REGIME_COLORS[k], alpha=0.7, label=REGIME_NAMES[k])
-        for k in sorted(REGIME_NAMES)
-    ]
-    fig.legend(
-        handles=patches,
-        loc="upper center",
-        ncol=5,
-        frameon=True,
-        facecolor="#1e1e1e",
-        edgecolor="#444444",
-        fontsize=9.5,
-        bbox_to_anchor=(0.5, 0.985),
+def _generate_single_worker(args):
+    case_idx, seed, duration_sec, fs = args
+    _, co2, awp, cdyn, labels = generate_synthetic_case(
+        duration_sec=duration_sec, fs=fs, seed=seed
     )
+    signals = np.stack([co2, awp, cdyn], axis=0).astype(np.float32)
+    return case_idx, signals, labels.astype(np.int64)
 
-    plt.show()
+
+def build_and_save_dataset(
+    output_dir="anesthesia_synth_dataset",
+    n_train=800,
+    n_val=100,
+    n_test=100,
+    duration_sec=500,
+    fs=128,
+    base_seed=2026,
+    n_workers=None,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    n_samples = int(duration_sec * fs)
+
+    splits = {
+        "train": (n_train, base_seed),
+        "val":   (n_val,   base_seed + 100_000),
+        "test":  (n_test,  base_seed + 200_000),
+    }
+
+    metadata = {
+        "fs": fs,
+        "duration_sec": duration_sec,
+        "n_samples_per_case": n_samples,
+        "channels": ["CO2_mmHg", "AWP_hPa", "Cdyn_mL_mbar"],
+        "regimes": {str(k): v for k, v in REGIME_NAMES.items()},
+        "splits": {},
+    }
+
+    for split_name, (n_cases, seed_offset) in splits.items():
+        print(f"\nGenerating '{split_name}' split ({n_cases} cases, {duration_sec}s @ {fs}Hz)...")
+        X = np.zeros((n_cases, 3, n_samples), dtype=np.float32)
+        y = np.zeros((n_cases, n_samples), dtype=np.int64)
+
+        tasks = [(i, seed_offset + i, duration_sec, fs) for i in range(n_cases)]
+
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = [executor.submit(_generate_single_worker, task) for task in tasks]
+            for completed, future in enumerate(as_completed(futures), 1):
+                case_idx, signals, labels = future.result()
+                X[case_idx] = signals
+                y[case_idx] = labels
+                if completed % max(1, n_cases // 5) == 0 or completed == n_cases:
+                    print(f"  [{split_name}] {completed}/{n_cases} cases complete")
+
+        unique, counts = np.unique(y, return_counts=True)
+        total_pts = y.size
+        class_dist = {
+            REGIME_NAMES[int(u)]: round(float(c / total_pts) * 100, 2)
+            for u, c in zip(unique, counts)
+        }
+        print(f"  [{split_name}] Regime distribution (%): {class_dist}")
+
+        out_path = os.path.join(output_dir, f"{split_name}.npz")
+        np.savez_compressed(out_path, X=X, y=y)
+        file_mb = os.path.getsize(out_path) / (1024 * 1024)
+        print(f"  Saved -> {out_path} ({file_mb:.1f} MB)")
+
+        metadata["splits"][split_name] = {
+            "n_cases": n_cases,
+            "seed_range": [seed_offset, seed_offset + n_cases - 1],
+            "class_distribution_pct": class_dist,
+            "file": f"{split_name}.npz",
+        }
+
+    train_data = np.load(os.path.join(output_dir, "train.npz"))["X"]
+    channel_means = train_data.mean(axis=(0, 2)).tolist()
+    channel_stds = train_data.std(axis=(0, 2)).tolist()
+    metadata["train_normalization"] = {
+        "mean": dict(zip(metadata["channels"], [round(m, 4) for m in channel_means])),
+        "std": dict(zip(metadata["channels"], [round(s, 4) for s in channel_stds])),
+    }
+
+    meta_path = os.path.join(output_dir, "metadata.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"\nDataset build complete! Metadata saved to {meta_path}")
+
 
 if __name__ == "__main__":
-    plot_sample_gallery(seeds=(12, 42, 108, 256))
+    build_and_save_dataset(
+        output_dir="anesthesia_synth_dataset",
+        n_train=1000,
+        n_val=200,
+        n_test=200,
+        duration_sec=500,
+        fs=128,
+    )
